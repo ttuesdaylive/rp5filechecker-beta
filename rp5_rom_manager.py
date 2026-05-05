@@ -9,13 +9,16 @@ tool, so the threaded copy behavior and all advanced options remain available.
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import importlib.util
 import os
+import platform
 import posixpath
 import queue as queue_module
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -97,6 +100,9 @@ class StorageChoice:
 @dataclass(frozen=True)
 class PreflightProfile:
     cpu_count: int
+    cpu_name: str
+    total_memory_bytes: int | None
+    available_memory_bytes: int | None
     adb_jobs: int
     local_jobs: int
     buffer_mb: int
@@ -110,16 +116,76 @@ class PreflightProfile:
     notes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SpeedProbeResult:
+    best_jobs: int
+    best_mbps: float
+    trials: tuple[tuple[int, float, int, int], ...]
+    sample_files: int
+    sample_bytes: int
+
+
 def clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-def recommend_jobs() -> tuple[int, int, int]:
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def windows_memory_status() -> tuple[int | None, int | None]:
+    if os.name != "nt":
+        return None, None
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return int(status.ullTotalPhys), int(status.ullAvailPhys)
+    return None, None
+
+
+def processor_name() -> str:
+    name = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "")
+    return " ".join(name.split()) or "CPU"
+
+
+def recommend_jobs() -> tuple[int, int, int, int | None, int | None, str]:
     cpu_count = os.cpu_count() or 4
-    adb_jobs = clamp(cpu_count // 2, 2, 6)
-    local_jobs = clamp(cpu_count * 2, 4, 16)
-    buffer_mb = 32 if cpu_count >= 8 else 16
-    return adb_jobs, local_jobs, buffer_mb
+    total_memory, available_memory = windows_memory_status()
+
+    memory_factor = 1.0
+    if available_memory is not None:
+        if available_memory < 2 * 1024**3:
+            memory_factor = 0.45
+        elif available_memory < 4 * 1024**3:
+            memory_factor = 0.65
+        elif available_memory < 8 * 1024**3:
+            memory_factor = 0.85
+
+    adb_ceiling = 12 if cpu_count >= 16 else 10 if cpu_count >= 12 else 8 if cpu_count >= 8 else 4
+    adb_jobs = clamp(int(round(min(cpu_count, adb_ceiling) * memory_factor)), 2, adb_ceiling)
+
+    local_ceiling = 32 if cpu_count >= 12 else 24 if cpu_count >= 8 else 16
+    local_jobs = clamp(int(round(cpu_count * 2 * memory_factor)), 4, local_ceiling)
+
+    if available_memory and available_memory >= 16 * 1024**3 and cpu_count >= 8:
+        buffer_mb = 64
+    elif available_memory and available_memory < 4 * 1024**3:
+        buffer_mb = 8
+    elif cpu_count >= 8:
+        buffer_mb = 32
+    else:
+        buffer_mb = 16
+    return adb_jobs, local_jobs, buffer_mb, total_memory, available_memory, processor_name()
 
 
 def existing_path_anchor(raw_path: str) -> Path:
@@ -232,10 +298,16 @@ class TransferWorker:
         self.settings = settings
         self.events = events
         self.stop_event = stop_event
+        self.active_lock = threading.Lock()
+        self.active_slots = 0
+        self.active_adb = 0
+        self.submitted_items = 0
+        self.total_items = 0
 
     def run(self) -> None:
         try:
             items, worker = self.prepare_transfer()
+            self.total_items = len(items)
             total_bytes = sum(item.size or 0 for item in items)
             has_known_sizes = any(item.size is not None for item in items)
             self.events.emit(
@@ -287,12 +359,7 @@ class TransferWorker:
         local_root = Path(self.settings.local).resolve()
         items = engine.with_dest(remote_items, lambda item: str(engine.rel_to_local(local_root, item.rel)))
         self.events.emit("phase", message=f"Ready to pull {len(items)} files.")
-        return items, lambda item: engine.adb_pull_file(
-            self.settings.adb,
-            self.settings.serial,
-            item,
-            self.settings.force,
-        )
+        return items, self.adb_pull_worker
 
     def prepare_adb_push(self) -> tuple[list[engine.TransferItem], Callable[[engine.TransferItem], engine.TransferResult]]:
         self.events.emit("phase", message="Checking Retroid connection...")
@@ -316,14 +383,8 @@ class TransferWorker:
 
         items = engine.with_dest(local_items, lambda item: engine.remote_join(self.settings.remote, item.rel))
         self.events.emit("phase", message=f"Ready to push {len(items)} files.")
-        return items, lambda item: engine.adb_push_file(
-            self.settings.adb,
-            self.settings.serial,
-            item,
-            self.settings.force,
-            remote_sizes,
-            self.settings.verify,
-        )
+        self.remote_sizes = remote_sizes
+        return items, self.adb_push_worker
 
     def prepare_local_copy(self) -> tuple[list[engine.TransferItem], Callable[[engine.TransferItem], engine.TransferResult]]:
         source = Path(self.settings.source).resolve()
@@ -341,7 +402,62 @@ class TransferWorker:
         source_items = engine.list_local_files(source, self.settings.include, self.settings.exclude)
         items = engine.with_dest(source_items, lambda item: str(engine.rel_to_local(dest, item.rel)))
         self.events.emit("phase", message=f"Ready to copy {len(items)} files.")
-        return items, lambda item: engine.copy_local_file(item, self.settings.force, self.settings.buffer_mb)
+        return items, self.local_copy_worker
+
+    def adb_pull_worker(self, item: engine.TransferItem) -> engine.TransferResult:
+        dest = Path(item.dest)
+        if not self.settings.force and dest.exists() and item.size is not None and engine.local_size(dest) == item.size:
+            if item.mtime is not None:
+                try:
+                    os.utime(dest, (item.mtime, item.mtime))
+                except OSError:
+                    pass
+            return engine.TransferResult(item, "skipped", bytes_done=item.size)
+        self.bump_active_adb(1)
+        try:
+            return engine.adb_pull_file(self.settings.adb, self.settings.serial, item, True)
+        finally:
+            self.bump_active_adb(-1)
+
+    def adb_push_worker(self, item: engine.TransferItem) -> engine.TransferResult:
+        remote_sizes = getattr(self, "remote_sizes", {})
+        if not self.settings.force and item.size is not None and remote_sizes.get(item.rel) == item.size:
+            return engine.TransferResult(item, "skipped", bytes_done=item.size)
+        self.bump_active_adb(1)
+        try:
+            return engine.adb_push_file(
+                self.settings.adb,
+                self.settings.serial,
+                item,
+                True,
+                remote_sizes,
+                self.settings.verify,
+            )
+        finally:
+            self.bump_active_adb(-1)
+
+    def local_copy_worker(self, item: engine.TransferItem) -> engine.TransferResult:
+        return engine.copy_local_file(item, self.settings.force, self.settings.buffer_mb)
+
+    def bump_active_adb(self, delta: int) -> None:
+        with self.active_lock:
+            self.active_adb = max(0, self.active_adb + delta)
+            self.emit_worker_update_locked()
+
+    def bump_active_slot(self, delta: int) -> None:
+        with self.active_lock:
+            self.active_slots = max(0, self.active_slots + delta)
+            self.emit_worker_update_locked()
+
+    def emit_worker_update_locked(self) -> None:
+        self.events.emit(
+            "workers",
+            active_slots=self.active_slots,
+            active_adb=self.active_adb,
+            jobs=self.settings.jobs,
+            submitted=self.submitted_items,
+            total=self.total_items,
+        )
 
     def emit_dry_run(self, items: list[engine.TransferItem], total_bytes: int) -> None:
         self.events.emit(
@@ -408,6 +524,9 @@ class TransferWorker:
             future = executor.submit(self.safe_worker_call, worker, item)
             pending[future] = item
             submitted += 1
+            with self.active_lock:
+                self.submitted_items = submitted
+                self.emit_worker_update_locked()
         return submitted
 
     def safe_worker_call(
@@ -417,7 +536,11 @@ class TransferWorker:
     ) -> engine.TransferResult:
         if self.stop_event.is_set():
             return engine.TransferResult(item, "skipped", "Stopped before this file started.", 0)
-        return worker(item)
+        self.bump_active_slot(1)
+        try:
+            return worker(item)
+        finally:
+            self.bump_active_slot(-1)
 
 
 class Tooltip:
@@ -513,6 +636,7 @@ class FastTransferGui:
         self.bytes_var = tk.StringVar(value="0 B")
         self.speed_var = tk.StringVar(value="0 B/s")
         self.counts_var = tk.StringVar(value="Copied 0 | Skipped 0 | Failed 0")
+        self.workers_var = tk.StringVar(value="Workers 0/0 | ADB 0 | Queue 0/0")
 
         self.checker_worker_thread: threading.Thread | None = None
         self.checker_busy = False
@@ -554,6 +678,8 @@ class FastTransferGui:
         self.tooltips: list[Tooltip] = []
         self.preflight_thread: threading.Thread | None = None
         self.preflight_busy = False
+        self.speed_probe_thread: threading.Thread | None = None
+        self.speed_probe_busy = False
         self.adb_install_thread: threading.Thread | None = None
         self.adb_install_busy = False
         self.preflight_profile: PreflightProfile | None = None
@@ -565,6 +691,7 @@ class FastTransferGui:
         self.preflight_jobs_var = tk.StringVar(value="Recommended jobs: waiting.")
         self.preflight_pc_var = tk.StringVar(value="PC folder: waiting.")
         self.preflight_device_var = tk.StringVar(value="Device: waiting.")
+        self.speed_probe_var = tk.StringVar(value="Speed probe: not run yet.")
         self.preflight_tree: ttk.Treeview
         self.preflight_buttons: list[ttk.Button] = []
         self.checker_source_panels: dict[str, ttk.Frame] = {}
@@ -608,7 +735,7 @@ class FastTransferGui:
         style.configure("TLabel", background=self.bg, foreground=self.text)
         style.configure("Card.TLabel", background=self.panel, foreground=self.text)
         style.configure("Muted.Card.TLabel", background=self.panel, foreground=self.muted)
-        style.configure("Hero.TLabel", background=self.bg, foreground=self.text, font=("Segoe UI Semibold", 22))
+        style.configure("Hero.TLabel", background=self.bg, foreground=self.text, font=("Segoe UI Semibold", 18))
         style.configure("Subhero.TLabel", background=self.bg, foreground=self.muted)
         style.configure("Section.Card.TLabel", background=self.panel, font=("Segoe UI Semibold", 12))
         style.configure("Stat.Card.TLabel", background=self.panel, font=("Segoe UI Semibold", 11))
@@ -626,11 +753,11 @@ class FastTransferGui:
         style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9))
 
     def build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=18)
+        outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
         header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 14))
+        header.pack(fill="x", pady=(0, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="RP5 ROM Manager", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
@@ -645,16 +772,22 @@ class FastTransferGui:
             "Switches between the full advanced layout and a calmer simple layout. Simple mode hides expert tuning, command previews, filters, and raw logs while keeping the main transfer and checker actions available.",
         )
 
-        self.build_preflight_panel(outer)
+        self.build_profile_strip(outer)
 
         notebook = ttk.Notebook(outer)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True)
+        setup_tab = ttk.Frame(notebook)
         transfer_tab = ttk.Frame(notebook)
         checker_tab = ttk.Frame(notebook)
+        notebook.add(setup_tab, text="Setup")
         notebook.add(transfer_tab, text="Fast Transfer")
         notebook.add(checker_tab, text="Sync Checker")
 
-        body = self.make_scroll_body(transfer_tab, padding=(0, 14, 0, 0))
+        setup_body = self.make_scroll_body(setup_tab, padding=(0, 10, 0, 0))
+        self.build_preflight_panel(setup_body)
+
+        body = self.make_scroll_body(transfer_tab, padding=(0, 10, 0, 0))
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
         body.rowconfigure(1, weight=1)
@@ -714,6 +847,53 @@ class FastTransferGui:
     def add_tip(self, widget: tk.Widget, text: str) -> tk.Widget:
         self.tooltips.append(Tooltip(widget, text))
         return widget
+
+    def build_profile_strip(self, parent: ttk.Frame) -> None:
+        strip = ttk.Frame(parent, style="Card.TFrame", padding=(12, 8))
+        strip.pack(fill="x", pady=(0, 10))
+        strip.columnconfigure(0, weight=2)
+        strip.columnconfigure(1, weight=1)
+        strip.columnconfigure(2, weight=1)
+        strip.columnconfigure(3, weight=1)
+        ttk.Label(strip, textvariable=self.preflight_status_var, style="Muted.Card.TLabel", wraplength=460).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 12),
+        )
+        ttk.Label(strip, textvariable=self.preflight_device_var, style="Stat.Card.TLabel", wraplength=240).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(0, 12),
+        )
+        ttk.Label(strip, textvariable=self.preflight_jobs_var, style="Stat.Card.TLabel", wraplength=260).grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(0, 12),
+        )
+        ttk.Label(strip, textvariable=self.speed_probe_var, style="Stat.Card.TLabel", wraplength=260).grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=(0, 12),
+        )
+        setup_button = ttk.Button(strip, text="Setup", command=self.show_setup_tab)
+        setup_button.grid(row=0, column=4, sticky="e", padx=(0, 8))
+        self.add_tip(setup_button, "Opens the Setup tab with storage choices, ADB install, USB help, and preflight details.")
+        run_button = ttk.Button(strip, text="Preflight", command=self.start_preflight_scan)
+        run_button.grid(row=0, column=5, sticky="e")
+        self.add_tip(run_button, "Runs the shared setup scan again without leaving the current tab.")
+        self.profile_strip_buttons = [setup_button, run_button]
+        self.add_tip(
+            strip,
+            "Compact status for the shared Library Profile. The full Setup tab has detected storage choices and help actions.",
+        )
+
+    def show_setup_tab(self) -> None:
+        if hasattr(self, "notebook"):
+            self.notebook.select(0)
 
     def toggle_simple_mode(self) -> None:
         self.simple_mode_var.set(not self.simple_mode_var.get())
@@ -822,7 +1002,13 @@ class FastTransferGui:
         usb_button = ttk.Button(buttons, text="USB Debugging Help", command=self.show_usb_debugging_help)
         usb_button.grid(row=3, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
         self.add_tip(usb_button, "Shows the RP5 steps for enabling Developer Options, turning on USB debugging, and accepting the trust prompt so ADB can see the device.")
-        self.preflight_buttons.extend([run_button, both_button, transfer_button, checker_button, browse_button, scan_button, adb_button, usb_button])
+        tune_button = ttk.Button(buttons, text="Tune Speed", command=self.start_speed_probe)
+        tune_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.add_tip(
+            tune_button,
+            "Benchmarks several ADB worker counts using a small temporary copy, then applies the fastest jobs setting. This is the best way to know whether more ADB processes actually improve your RP5 transfer rate.",
+        )
+        self.preflight_buttons.extend([run_button, both_button, transfer_button, checker_button, browse_button, scan_button, adb_button, usb_button, tune_button])
 
         chooser = ttk.Frame(panel, style="Card.TFrame")
         chooser.grid(row=0, column=1, sticky="nsew")
@@ -845,6 +1031,12 @@ class FastTransferGui:
         self.add_tip(
             self.preflight_tree,
             "Shows storage roots and likely ROM folders found on the RP5. Pick the ROMs folder, usually something like /storage/4A21-0000/ROMs, then apply it to Transfer, Checker, or both.",
+        )
+        ttk.Label(chooser, textvariable=self.speed_probe_var, style="Muted.Card.TLabel", wraplength=720).grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=(8, 0),
         )
         self.update_preflight_buttons()
 
@@ -1120,6 +1312,11 @@ class FastTransferGui:
         ttk.Label(stats, textvariable=self.bytes_var, style="Stat.Card.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(stats, textvariable=self.speed_var, style="Stat.Card.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(stats, textvariable=self.counts_var, style="Stat.Card.TLabel").grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(stats, textvariable=self.workers_var, style="Stat.Card.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_tip(
+            stats,
+            "Worker slots are the Python copy workers currently busy. ADB active is the number of live ADB copy processes; skipped files do not start ADB, and the RP5/ADB server may throttle transfers even when slots are available.",
+        )
 
         buttons = ttk.Frame(progress_frame, style="Card.TFrame")
         buttons.grid(row=3, column=0, sticky="ew", pady=(14, 0))
@@ -1152,8 +1349,7 @@ class FastTransferGui:
         self.add_tip(self.log_text, "Shows detailed transfer messages, errors, and optional per-file activity. Hidden in Simple Mode to reduce noise.")
 
     def build_checker_tab(self, parent: ttk.Frame) -> None:
-        body = ttk.Frame(parent, padding=(0, 14, 0, 0))
-        body.pack(fill="both", expand=True)
+        body = self.make_scroll_body(parent, padding=(0, 10, 0, 0))
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
         body.rowconfigure(1, weight=1)
@@ -1536,6 +1732,178 @@ class FastTransferGui:
             "Then run Preflight or Check Device again. If Windows asks for a USB mode, File Transfer is usually fine.",
         )
 
+    def start_speed_probe(self) -> None:
+        if self.speed_probe_busy:
+            return
+        if self.is_busy() or self.is_checker_busy():
+            messagebox.showinfo("Work running", "Wait for transfers or checker jobs to finish before tuning speed.")
+            return
+        adb = self.adb_var.get().strip() or "adb"
+        serial = self.serial_var.get().strip() or self.checker_adb_device_var.get().strip() or None
+        remote = self.remote_var.get().strip() or self.checker_adb_root_var.get().strip()
+        if not remote:
+            messagebox.showerror("Missing Retroid folder", "Choose a Retroid folder before tuning speed.")
+            return
+        local_anchor = existing_path_anchor(self.current_pc_path_for_preflight())
+
+        self.speed_probe_busy = True
+        self.speed_probe_var.set("Speed probe: scanning sample files...")
+        self.preflight_status_var.set("Speed probe is testing ADB worker counts with temporary copies.")
+        self.update_preflight_buttons()
+
+        def run() -> None:
+            try:
+                result = self.collect_speed_probe(adb, serial, remote, local_anchor)
+            except Exception as exc:  # noqa: BLE001
+                details = "".join(traceback.format_exception(exc))
+                self.events.put(("speed_probe_error", {"message": str(exc), "details": details}))
+            else:
+                self.events.put(("speed_probe_done", {"result": result}))
+
+        self.speed_probe_thread = threading.Thread(target=run, daemon=True)
+        self.speed_probe_thread.start()
+
+    def collect_speed_probe(
+        self,
+        adb: str,
+        serial: str | None,
+        remote: str,
+        local_anchor: Path,
+    ) -> SpeedProbeResult:
+        engine.check_adb(adb, serial)
+        remote_items = engine.list_remote_files(adb, serial, remote)
+        sample = self.speed_probe_sample(remote_items)
+        if not sample:
+            raise RuntimeError("No suitable sample files were found in the selected Retroid folder.")
+
+        current_jobs = 4
+        try:
+            current_jobs = max(1, int(float(self.jobs_var.get())))
+        except ValueError:
+            pass
+        profile_jobs = self.preflight_profile.adb_jobs if self.preflight_profile else 6
+        max_jobs = clamp(max(current_jobs, profile_jobs) * 2, 2, 12)
+        max_jobs = min(max_jobs, max(1, len(sample)))
+        candidates = sorted(
+            {
+                jobs
+                for jobs in (1, 2, 3, 4, 6, 8, 10, 12, current_jobs, profile_jobs)
+                if 1 <= jobs <= max_jobs
+            }
+        )
+        if not candidates:
+            candidates = [1]
+
+        sample_bytes = sum(item.size or 0 for item in sample)
+        trials: list[tuple[int, float, int, int]] = []
+        probe_root = local_anchor / ".rp5_speed_probe_tmp"
+        if probe_root.exists():
+            shutil.rmtree(probe_root, ignore_errors=True)
+        probe_root.mkdir(parents=True, exist_ok=True)
+        try:
+            for jobs in candidates:
+                mbps, failures = self.run_speed_probe_trial(adb, serial, sample, probe_root, jobs)
+                trials.append((jobs, mbps, len(sample), failures))
+                self.events.put(
+                    (
+                        "speed_probe_progress",
+                        {"jobs": jobs, "mbps": mbps, "failures": failures, "sample_files": len(sample)},
+                    )
+                )
+        finally:
+            shutil.rmtree(probe_root, ignore_errors=True)
+
+        usable = [trial for trial in trials if trial[3] == 0]
+        if not usable:
+            raise RuntimeError("All speed-probe trials failed. Check the transfer log for ADB errors.")
+        best = max(usable, key=lambda trial: trial[1])
+        return SpeedProbeResult(
+            best_jobs=best[0],
+            best_mbps=best[1],
+            trials=tuple(trials),
+            sample_files=len(sample),
+            sample_bytes=sample_bytes,
+        )
+
+    def speed_probe_sample(self, items: list[engine.TransferItem]) -> list[engine.TransferItem]:
+        sized = [item for item in items if item.size and item.size > 0]
+        if not sized:
+            return items[:24]
+        small = sorted((item for item in sized if item.size <= 64 * 1024**2), key=lambda item: item.size or 0)
+        sample: list[engine.TransferItem] = []
+        total = 0
+        for item in small:
+            sample.append(item)
+            total += item.size or 0
+            if total >= 48 * 1024**2 or len(sample) >= 80:
+                break
+        if total < 16 * 1024**2:
+            for item in sorted(sized, key=lambda item: item.size or 0):
+                if item in sample or (item.size or 0) > 256 * 1024**2:
+                    continue
+                sample.append(item)
+                total += item.size or 0
+                if total >= 64 * 1024**2 or len(sample) >= 48:
+                    break
+        return sample[:96]
+
+    def run_speed_probe_trial(
+        self,
+        adb: str,
+        serial: str | None,
+        sample: list[engine.TransferItem],
+        probe_root: Path,
+        jobs: int,
+    ) -> tuple[float, int]:
+        trial_root = Path(tempfile.mkdtemp(prefix=f"jobs_{jobs}_", dir=probe_root))
+        copied_bytes = 0
+        failures = 0
+        start = time.monotonic()
+
+        def probe_item(item: engine.TransferItem) -> engine.TransferResult:
+            dest = engine.rel_to_local(trial_root, item.rel)
+            probe = engine.TransferItem(item.rel, item.source, str(dest), item.size, item.mtime)
+            return engine.adb_pull_file(adb, serial, probe, True)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = [executor.submit(probe_item, item) for item in engine.sort_for_transfer(sample)]
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    if result.status == "failed":
+                        failures += 1
+                    else:
+                        copied_bytes += result.bytes_done or result.item.size or 0
+        finally:
+            shutil.rmtree(trial_root, ignore_errors=True)
+
+        elapsed = max(time.monotonic() - start, 0.001)
+        mbps = (copied_bytes / elapsed) / (1024 * 1024)
+        return mbps, failures
+
+    def finish_speed_probe(self, result: SpeedProbeResult) -> None:
+        self.speed_probe_busy = False
+        self.speed_probe_thread = None
+        self.jobs_var.set(str(result.best_jobs))
+        trial_text = ", ".join(f"{jobs}={mbps:.1f} MB/s" for jobs, mbps, _files, failures in result.trials if failures == 0)
+        self.speed_probe_var.set(
+            f"Speed probe: best {result.best_jobs} jobs at {result.best_mbps:.1f} MB/s"
+        )
+        self.preflight_status_var.set(
+            f"Speed probe used {result.sample_files} files ({engine.human_bytes(result.sample_bytes)} sample). Results: {trial_text}"
+        )
+        self.append_log(self.preflight_status_var.get())
+        self.update_preflight_buttons()
+
+    def finish_speed_probe_error(self, message: str, details: str | None = None) -> None:
+        self.speed_probe_busy = False
+        self.speed_probe_thread = None
+        self.speed_probe_var.set(f"Speed probe failed: {message}")
+        if details:
+            self.append_log(details)
+        self.update_preflight_buttons()
+        messagebox.showerror("Speed probe failed", message)
+
     def collect_preflight_profile(
         self,
         adb: str,
@@ -1544,7 +1912,7 @@ class FastTransferGui:
         pc_path: str,
     ) -> PreflightProfile:
         cpu_count = os.cpu_count() or 4
-        adb_jobs, local_jobs, buffer_mb = recommend_jobs()
+        adb_jobs, local_jobs, buffer_mb, total_memory, available_memory, cpu_name = recommend_jobs()
         disk_path, free_bytes, total_bytes = disk_usage_for(pc_path)
         notes: list[str] = []
         devices: list[str] = []
@@ -1578,6 +1946,9 @@ class FastTransferGui:
             choices = (StorageChoice("Current path", posixpath.basename(remote.rstrip("/")) or remote, remote),)
         return PreflightProfile(
             cpu_count=cpu_count,
+            cpu_name=cpu_name,
+            total_memory_bytes=total_memory,
+            available_memory_bytes=available_memory,
             adb_jobs=adb_jobs,
             local_jobs=local_jobs,
             buffer_mb=buffer_mb,
@@ -1617,10 +1988,17 @@ class FastTransferGui:
         else:
             self.preflight_pc_var.set(f"PC folder: {profile.pc_path} | free space unknown")
 
+        resource_note = f"{profile.cpu_count} logical CPUs"
+        if profile.available_memory_bytes is not None:
+            resource_note += f", {engine.human_bytes(profile.available_memory_bytes)} RAM free"
         if profile.notes:
-            self.preflight_status_var.set("Preflight complete with notes: " + " | ".join(profile.notes[:2]))
+            self.preflight_status_var.set(
+                f"Preflight complete ({resource_note}) with notes: " + " | ".join(profile.notes[:2])
+            )
         else:
-            self.preflight_status_var.set("Preflight complete. Device, storage choices, and job recommendations are ready.")
+            self.preflight_status_var.set(
+                f"Preflight complete ({resource_note}). Device, storage choices, and job recommendations are ready."
+            )
 
         recommended = next((choice for choice in self.storage_choices if choice.recommended), None)
         if recommended:
@@ -1729,16 +2107,24 @@ class FastTransferGui:
             self.buffer_mb_var.set(str(profile.buffer_mb))
 
     def update_preflight_buttons(self) -> None:
+        if hasattr(self, "profile_strip_buttons"):
+            for index, button in enumerate(self.profile_strip_buttons):
+                if index == 1:
+                    button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or self.speed_probe_busy else "normal")
+                else:
+                    button.configure(state="normal")
         if not self.preflight_buttons:
             return
         has_choices = bool(self.storage_choices)
         for index, button in enumerate(self.preflight_buttons):
             if index == 0:
-                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy else "normal")
+                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or self.speed_probe_busy else "normal")
             elif 1 <= index <= 5:
-                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or not has_choices else "normal")
+                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or self.speed_probe_busy or not has_choices else "normal")
             elif index == 6:
-                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy else "normal")
+                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or self.speed_probe_busy else "normal")
+            elif index == 8:
+                button.configure(state="disabled" if self.preflight_busy or self.adb_install_busy or self.speed_probe_busy else "normal")
             else:
                 button.configure(state="normal")
 
@@ -2311,6 +2697,10 @@ class FastTransferGui:
         self.live_interval_ms = max(250, int(settings.progress_interval * 1000))
         self.status_var.set("Starting...")
         self.append_log(f"Starting {MODE_LABELS[settings.mode]}{' dry run' if settings.dry_run else ''}.")
+        if settings.mode in {"adb-pull", "adb-push"}:
+            self.append_log(
+                "Worker note: skipped files do not start ADB, tiny files may finish instantly, and the RP5/ADB server can throttle concurrent copy processes."
+            )
         self.append_log(self.command_line_for(settings))
         event_bus = EventBus(self.events)
         runner = TransferWorker(settings, event_bus, self.stop_event)
@@ -2412,6 +2802,8 @@ class FastTransferGui:
             self.refresh_live_stats()
         elif event == "result":
             self.apply_result(payload["result"])
+        elif event == "workers":
+            self.update_worker_stats(payload)
         elif event == "done":
             self.finish_transfer(payload["code"], payload.get("stopped", False))
         elif event == "error":
@@ -2441,6 +2833,14 @@ class FastTransferGui:
             self.finish_adb_install(payload["adb_path"])
         elif event == "adb_install_error":
             self.finish_adb_install_error(payload["message"], payload.get("details"))
+        elif event == "speed_probe_done":
+            self.finish_speed_probe(payload["result"])
+        elif event == "speed_probe_error":
+            self.finish_speed_probe_error(payload["message"], payload.get("details"))
+        elif event == "speed_probe_progress":
+            self.speed_probe_var.set(
+                f"Speed probe: {payload['jobs']} jobs -> {payload['mbps']:.1f} MB/s"
+            )
 
     def show_remote_browser_dirs(self, path: str, entries: list[engine.RemoteDirEntry]) -> None:
         self.remote_browser_entries = entries
@@ -2523,11 +2923,22 @@ class FastTransferGui:
             self.append_log(f"Failed: {result.item.rel} - {result.message}")
         self.refresh_live_stats()
 
+    def update_worker_stats(self, payload: dict) -> None:
+        active_slots = payload.get("active_slots", 0)
+        active_adb = payload.get("active_adb", 0)
+        jobs = payload.get("jobs", 0)
+        submitted = payload.get("submitted", 0)
+        total = payload.get("total", 0)
+        self.workers_var.set(
+            f"Workers {active_slots}/{jobs} | ADB active {active_adb} | Queue {submitted}/{total}"
+        )
+
     def finish_transfer(self, code: int, stopped: bool) -> None:
         self.transfer_finished_at = time.monotonic()
         self.refresh_live_stats()
         self.worker_thread = None
         self.set_busy(False)
+        self.workers_var.set("Workers 0/0 | ADB active 0 | Queue complete")
         if stopped:
             self.status_var.set("Stopped.")
             self.append_log("Stopped. Any files already completed were left in place.")
@@ -2591,6 +3002,7 @@ class FastTransferGui:
         self.bytes_var.set("0 B")
         self.speed_var.set("0 B/s")
         self.counts_var.set("Copied 0 | Skipped 0 | Failed 0")
+        self.workers_var.set("Workers 0/0 | ADB active 0 | Queue 0/0")
 
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
