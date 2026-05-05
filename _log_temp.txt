@@ -1,9 +1,0 @@
-=== run start === 
-cwd: C:\Users\jakec\Documents\Python Projects (GRAVEYARD BFFR)\rp5filechecker 
- D _publish_log.txt
- D _run_publish_with_log.cmd
-?? _cleanup4.cmd
-?? _log_temp.txt
-Unstaged changes after reset:
-D	_publish_log.txt
-D	_run_publish_with_log.cmd
