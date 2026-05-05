@@ -69,7 +69,7 @@ if ($hasBetaBranch) {
 
 RunGit @("tag", "-f", $BetaTag, "HEAD")
 RunGit @("push", "origin", "HEAD:$BaseBranch")
-RunGit @("push", "origin", "--force", "$BetaBranch:$BetaBranch")
+RunGit @("push", "origin", "--force", "${BetaBranch}:${BetaBranch}")
 RunGit @("push", "origin", "--force", "$BetaTag")
 
 if ($currentBranch -ne $BaseBranch) {
