@@ -60,8 +60,9 @@ if (-not $hasCommits) {
     }
 }
 
-$existingOrigin = (& git -C $RepoRoot remote get-url origin 2>$null)
-if ($LASTEXITCODE -eq 0 -and $existingOrigin) {
+$configuredRemotes = @(& git -C $RepoRoot remote)
+$hasOrigin = $configuredRemotes -contains "origin"
+if ($hasOrigin) {
     Step "Updating origin remote"
     RunGit @("remote", "set-url", "origin", $RepoUrl)
 } else {
@@ -73,7 +74,7 @@ Step "Pushing main to GitHub"
 RunGit @("push", "-u", "origin", "main")
 
 Step "Refreshing beta branch/tag"
-& powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "publish_beta.ps1")
+& powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "publish_beta.ps1") -AllowCleanWorktree
 if ($LASTEXITCODE -ne 0) {
     throw "publish_beta.ps1 failed."
 }

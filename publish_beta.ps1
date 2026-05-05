@@ -1,7 +1,8 @@
 param(
     [string]$BetaBranch = "beta",
     [string]$BaseBranch = "main",
-    [string]$BetaTag = "beta"
+    [string]$BetaTag = "beta",
+    [switch]$AllowCleanWorktree
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,7 +41,8 @@ if (-not $remoteNames -or $remoteNames.Count -eq 0) {
 }
 
 $statusLines = @(& git -C $RepoRoot status --porcelain)
-if ($statusLines.Count -eq 0) {
+$needsCommit = $statusLines.Count -gt 0
+if (-not $needsCommit -and -not $AllowCleanWorktree) {
     Write-Output "No local changes detected. Beta remains unchanged."
     exit 0
 }
@@ -50,10 +52,12 @@ if (-not $currentBranch) {
     Fail "Could not determine the current branch."
 }
 
-RunGit @("add", "-A")
-$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
-$commitMessage = "Update beta from PC snapshot $timestamp"
-RunGit @("commit", "-m", $commitMessage)
+if ($needsCommit) {
+    RunGit @("add", "-A")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
+    $commitMessage = "Update beta from PC snapshot $timestamp"
+    RunGit @("commit", "-m", $commitMessage)
+}
 
 $betaBranchOutput = @(& git -C $RepoRoot branch --list $BetaBranch)
 $hasBetaBranch = $betaBranchOutput.Count -gt 0
@@ -72,4 +76,8 @@ if ($currentBranch -ne $BaseBranch) {
     RunGit @("checkout", $currentBranch)
 }
 
-Write-Output "Published commit to '$BaseBranch' and refreshed '$BetaBranch'/'$BetaTag'."
+if ($needsCommit) {
+    Write-Output "Published commit to '$BaseBranch' and refreshed '$BetaBranch'/'$BetaTag'."
+} else {
+    Write-Output "Published current HEAD to '$BetaBranch'/'$BetaTag' from a clean working tree."
+}
