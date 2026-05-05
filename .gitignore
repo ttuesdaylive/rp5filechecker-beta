@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+
+# Local machine settings; keep secrets and device-specific paths out of git.
+rp5_sync_checker_config.json
